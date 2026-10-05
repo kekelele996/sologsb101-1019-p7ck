@@ -64,7 +64,9 @@ watch(
 )
 
 const currentVolume = computed(() => volumes.value.find((volume) => volume.id === bookStore.currentVolumeId) ?? null)
-const locked = computed(() => (currentVolume.value ? isVolumeLocked(currentVolume.value.state) : false))
+const locked = computed(() =>
+  currentVolume.value ? isVolumeLocked(currentVolume.value.state, currentVolume.value.legacyReadOnly) : false
+)
 
 const FILTER_KEYS = ['damageType', 'state'] as const
 const url = useFilterQuery(FILTER_KEYS)
@@ -116,7 +118,11 @@ function openCreate(): void {
     return
   }
   if (locked.value) {
-    ElMessage.warning('该册已装订锁定，不能再新增书叶记录')
+    ElMessage.warning(
+      currentVolume.value?.legacyReadOnly
+        ? '该册是补不出历史方案的旧档，只读留着，不能再新增书叶记录'
+        : '该册已装订锁定，不能再新增书叶记录'
+    )
     return
   }
   const existing = leafStore.leavesOfVolume(volumeId)
@@ -140,14 +146,18 @@ function openEdit(leaf: Leaf): void {
 }
 
 async function submit(): Promise<void> {
-  if (editing.value) {
-    await leafStore.updateLeaf(editing.value.id, { ...form })
-    ElMessage.success(`已更新第 ${form.leafNo} 叶破损记录`)
-  } else {
-    await leafStore.createLeaf({ ...form })
-    ElMessage.success(`已登记第 ${form.leafNo} 叶破损记录`)
+  try {
+    if (editing.value) {
+      await leafStore.updateLeaf(editing.value.id, { ...form })
+      ElMessage.success(`已更新第 ${form.leafNo} 叶破损记录`)
+    } else {
+      await leafStore.createLeaf({ ...form })
+      ElMessage.success(`已登记第 ${form.leafNo} 叶破损记录`)
+    }
+    dialog.value = false
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : '保存失败')
   }
-  dialog.value = false
 }
 
 async function remove(leaf: Leaf): Promise<void> {
@@ -160,13 +170,21 @@ async function remove(leaf: Leaf): Promise<void> {
   } catch {
     return
   }
-  await leafStore.removeLeaf(leaf.id)
-  ElMessage.success('已删除')
+  try {
+    await leafStore.removeLeaf(leaf.id)
+    ElMessage.success('已删除')
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : '删除失败')
+  }
 }
 
 async function advance(leaf: Leaf): Promise<void> {
-  await leafStore.advanceLeafState(leaf.id)
-  ElMessage.success(`第 ${leaf.leafNo} 叶状态已推进`)
+  try {
+    await leafStore.advanceLeafState(leaf.id)
+    ElMessage.success(`第 ${leaf.leafNo} 叶状态已推进`)
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : '推进失败')
+  }
 }
 
 async function applyBatchState(): Promise<void> {
@@ -174,12 +192,16 @@ async function applyBatchState(): Promise<void> {
     ElMessage.warning('请先勾选书叶记录')
     return
   }
-  await leafStore.batchUpdate(
-    selected.value.map((leaf) => leaf.id),
-    { state: batchState.value }
-  )
-  ElMessage.success(`已批量改为${LEAF_STATE_LABEL[batchState.value]}`)
-  selected.value = []
+  try {
+    await leafStore.batchUpdate(
+      selected.value.map((leaf) => leaf.id),
+      { state: batchState.value }
+    )
+    ElMessage.success(`已批量改为${LEAF_STATE_LABEL[batchState.value]}`)
+    selected.value = []
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : '批量操作失败')
+  }
 }
 
 function handleSelectionChange(list: Leaf[]): void {
@@ -187,6 +209,10 @@ function handleSelectionChange(list: Leaf[]): void {
 }
 
 async function addLeafRecord(leaf: Leaf): Promise<void> {
+  if (locked.value) {
+    ElMessage.warning('该册已锁定 / 旧档只读，不能再登记破损')
+    return
+  }
   editing.value = null
   Object.assign(form, createEmptyLeafDraft(leaf.volumeId, leaf.leafNo))
   dialog.value = true
@@ -240,12 +266,16 @@ function stateColor(state: string): string {
 
       <el-alert
         v-if="locked"
-        type="warning"
+        :type="currentVolume && currentVolume.legacyReadOnly ? 'info' : 'warning'"
         show-icon
         :closable="false"
         style="margin-bottom: 12px"
-        title="该册已装订完成，整册锁定为只读"
-        description="如需继续登记破损，请先在古籍台账中把册次状态回退为「修复中」。"
+        :title="currentVolume && currentVolume.legacyReadOnly ? '该册为旧档只读：升级时补不出历史方案' : '该册已装订完成，整册锁定为只读'"
+        :description="
+          currentVolume && currentVolume.legacyReadOnly
+            ? '该册缺少补纸选配或工序记录，无法回填历史方案，按规则只读留着。'
+            : '如需继续登记破损，请先在古籍台账中把册次状态回退为「修复中」。'
+        "
       />
 
       <el-card shadow="never" style="margin-bottom: 14px">
@@ -284,7 +314,7 @@ function stateColor(state: string): string {
           <el-select v-model="batchState" size="small" style="width: 110px">
             <el-option v-for="item in LEAF_STATE_OPTIONS" :key="item.value" :label="item.label" :value="item.value" />
           </el-select>
-          <el-button size="small" :disabled="selected.length === 0" @click="applyBatchState">
+          <el-button size="small" :disabled="selected.length === 0 || locked" @click="applyBatchState">
             批量改状态（{{ selected.length }}）
           </el-button>
         </template>
@@ -343,10 +373,10 @@ function stateColor(state: string): string {
           </el-table-column>
           <el-table-column label="操作" min-width="260">
             <template #default="{ row }">
-              <el-button size="small" text type="primary" @click="advance(row)">推进状态</el-button>
-              <el-button size="small" text @click="addLeafRecord(row)">叠加破损</el-button>
+              <el-button size="small" text type="primary" :disabled="locked" @click="advance(row)">推进状态</el-button>
+              <el-button size="small" text :disabled="locked" @click="addLeafRecord(row)">叠加破损</el-button>
               <el-button size="small" text :disabled="locked" :icon="Edit" @click="openEdit(row)">编辑</el-button>
-              <el-button size="small" text type="danger" :icon="Delete" @click="remove(row)">删除</el-button>
+              <el-button size="small" text type="danger" :disabled="locked" :icon="Delete" @click="remove(row)">删除</el-button>
             </template>
           </el-table-column>
         </el-table>

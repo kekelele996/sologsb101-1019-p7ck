@@ -21,6 +21,11 @@ export interface Volume {
   bindingType: BindingType;
   /** 当前状态 */
   state: VolumeState;
+  /**
+   * 旧数据只读标记（v2→v3 升级时设置）：
+   * 该册在升级前有实做数据但按现有配纸 / 工序补不出历史方案，整册只读留存。
+   */
+  legacyReadOnly?: boolean;
   createdAt: number;
   updatedAt: number;
 }
@@ -60,9 +65,9 @@ export const VOLUME_STATE_OPTIONS: ReadonlyArray<{ value: VolumeState; label: st
   { value: 'archived', label: '已归档' },
 ];
 
-/** 装订完成后整册锁定为只读 */
-export function isVolumeLocked(state: VolumeState): boolean {
-  return state === 'bound' || state === 'archived';
+/** 装订完成后整册锁定为只读；升级补不出历史方案的旧档同样只读 */
+export function isVolumeLocked(state: VolumeState, legacyReadOnly?: boolean): boolean {
+  return legacyReadOnly === true || state === 'bound' || state === 'archived';
 }
 
 export const VOLUME_STATE_FLOW: readonly VolumeState[] = ['pending', 'repairing', 'bound', 'archived'];

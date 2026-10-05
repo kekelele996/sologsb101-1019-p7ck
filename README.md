@@ -42,9 +42,9 @@ docker compose up -d --build      # 代码改动后重新构建
 | 语言 | TypeScript（`strict: true`，`noUnusedLocals`） | `npm run build` 内含 `vue-tsc --noEmit` 类型检查 |
 | UI 组件库 | Element Plus 2.x（含 `@element-plus/icons-vue`） | 表格、表单、对话框、单选按钮组、空态 |
 | 构建工具 | Vite 6 | 开发服务器端口 22819 |
-| 状态管理 | Pinia（setup store） | `bookStore` / `leafStore` / `repairStore` |
+| 状态管理 | Pinia（setup store） | `bookStore` / `leafStore` / `repairStore` / `planStore` / `authStore` |
 | 路由 | Vue Router 4（history 模式） | nginx 侧配合 `try_files` 做 SPA fallback |
-| 本地存储 | Dexie 4（IndexedDB 封装）+ localStorage | 含数据结构版本号与 v1→v2 升级迁移 |
+| 本地存储 | Dexie 4（IndexedDB 封装）+ localStorage | 含数据结构版本号与 v1→v2、v2→v3 升级迁移 |
 | 容器化 | Docker 多阶段构建：`node:20-alpine` → `nginx:alpine` | 构建阶段类型检查 + 打包，运行阶段仅托管静态产物 |
 
 ---
@@ -69,9 +69,10 @@ npm run preview    # 本地预览构建产物（http://localhost:22819）
 | --- | --- | --- | --- |
 | `/books` | 古籍与册次台账 | 新建古籍、按年代与保护级别筛选（同步 URL query），对话框内管理册次，装订完成后整册锁定只读 | Book、Volume |
 | `/books/:id/leaves` | 书叶破损登记 | 册次切换、逐叶录入破损类型（可叠加）、面积与 pH，批量改状态；**直接深链不存在的 id 显示友好空态** | Leaf、Volume |
+| `/plans` | 修复方案与归档对账 | 主管按册立方案（目标 pH / 补纸 / 工序 / 预计完工日），草稿可改、定稿后只能作废重立；修复师登记偏离说明；归档前四项逐项对账，挂起项不许归档 | RepairPlan、Deviation 及全部模型 |
 | `/papers` | 补纸选配与染色比对 | 按 ΔE 升序排列候选补纸、帘纹匹配度与综合评分，ΔE 超阈值提示重新染色 | Paper、Leaf |
 | `/repairs` | 修复工序记录 | 拖拽调整工序先后并重编号、回填材料与操作人，完成即回写书叶状态，一键生成标准序列 | RepairOrder、Leaf |
-| `/export` | 装订还原与验收归档 | 装订登记 + 验收结论（合格触发全册归档）、JSON 导入导出、归档清单与破损台账 CSV | Binding 及全部模型 |
+| `/export` | 装订还原与验收归档 | 装订登记 + 验收结论（**合格也要通过方案对账才触发归档**）、JSON 导入导出、归档清单与破损台账 CSV | Binding 及全部模型 |
 
 `/` 与未匹配路径重定向到 `/books`。筛选条件写入 URL query（`?kw=&damageType=&state=` 等），可从任意设备复用链接。
 
@@ -86,9 +87,14 @@ npm run preview    # 本地预览构建产物（http://localhost:22819）
 | Leaf 书叶 | `src/types/leaf.ts` | `id` `volumeId` `leafNo` `damageType`（虫蛀/酸化/絮化/缺肉/水渍） `damageAreaCm2` `phValue` `state`（待修/修复中/已修复） | 同叶可叠加多种破损，按册汇总面积与平均 pH |
 | Paper 补纸 | `src/types/paper.ts` | `id` `leafId` `paperType`（竹纸/皮纸/宣纸） `laidPattern` `thicknessMm` `deltaE` `dyeRecipe` | 按色差排序候选，ΔE 超阈值提示重新染色 |
 | RepairOrder 修复工序 | `src/types/repairOrder.ts` | `id` `leafId` `seq` `name`（补破/托裱/溜口/裁齐/压平） `material` `operator` `date` `state`（未开始/进行中/已完成） | 拖拽调序，完成即回写书叶状态 |
-| Binding 装订 | `src/types/binding.ts` | `id` `volumeId` `method` `finishDate` `verdict`（合格/返修） `inspector` | 合格触发全册归档，返修退回修复中 |
+| Binding 装订 | `src/types/binding.ts` | `id` `volumeId` `method` `finishDate` `verdict`（合格/返修） `inspector` | 合格且通过方案对账才触发全册归档，返修退回修复中 |
+| RepairPlan 修复方案 | `src/types/repairPlan.ts` | `id` `volumeId` `revision`（作废重立递增） `targetPh` `paperType` `steps` `plannedFinishDate` `state`（草稿/已定稿/已作废） `supervisor` `historical`（升级回填只读） | 主管按册先立；定稿后主管也不能改，要改只能作废重立；修复师动不了方案 |
+| Deviation 偏离说明 | `src/types/deviation.ts` | `id` `volumeId` `planId` `kind`（目标pH/补纸/工序/工期） `planned` `actual` `reason` `recorder` `resolution` `status`（待认定/已认定） | 修复师登记实做与方案的出入；主管对账后补认定结论，覆盖对应挂起项 |
 
-数据结构版本号 `DB_VERSION` 定义在 `src/utils/db.ts`，当前为 `v2`：`papers` 表增加 `dyeRecipe` 字段，并在 Dexie `.upgrade()` 中按纸种回填默认染色配方（竹纸 / 皮纸 / 宣纸 各有基准配方）。
+数据结构版本号 `DB_VERSION` 定义在 `src/utils/db.ts`，当前为 `v3`：
+
+- **v1→v2**：`papers` 表增加 `dyeRecipe` 字段，并在 Dexie `.upgrade()` 中按纸种回填默认染色配方（竹纸 / 皮纸 / 宣纸 各有基准配方）。
+- **v2→v3**：新增 `repairPlans` / `deviations` 两表。**旧数据没方案，升级时按现有配纸和工序回填一份历史方案**（`historical=true`、已定稿、只读留存，目标 pH 取实做平均、纸种取众数、工序取已登记工序、完工日取装订完工日）；**补不上的册次**（缺补纸选配或缺工序记录）在 `volumes` 上置 `legacyReadOnly=true`，**只读留着**，不能再立方案或改动实做。
 
 ---
 
@@ -98,13 +104,13 @@ npm run preview    # 本地预览构建产物（http://localhost:22819）
 sologsb101-1019/
 ├── frontend/                     # 前端源码
 │   ├── src/
-│   │   ├── types/                # book.ts volume.ts leaf.ts paper.ts repairOrder.ts binding.ts
-│   │   ├── stores/               # bookStore.ts leafStore.ts repairStore.ts
-│   │   ├── components/common/    # DamageTag.vue FilterBar.vue StatBadge.vue EmptyPanel.vue
-│   │   ├── hooks/                # useLeafStats.ts useIdbTable.ts
-│   │   ├── pages/                # BookList.vue LeafBoard.vue PaperMatch.vue RepairWorkflow.vue ExportView.vue
+│   │   ├── types/                # book.ts volume.ts leaf.ts paper.ts repairOrder.ts binding.ts repairPlan.ts deviation.ts
+│   │   ├── stores/               # bookStore.ts leafStore.ts repairStore.ts planStore.ts authStore.ts
+│   │   ├── components/common/    # DamageTag.vue FilterBar.vue StatBadge.vue EmptyPanel.vue PlanTag.vue
+│   │   ├── hooks/                # useLeafStats.ts useIdbTable.ts usePlanReconcile.ts
+│   │   ├── pages/                # BookList.vue LeafBoard.vue PlanBoard.vue PaperMatch.vue RepairWorkflow.vue ExportView.vue
 │   │   ├── router/               # index.ts
-│   │   ├── utils/                # paperColor.ts db.ts export.ts
+│   │   ├── utils/                # paperColor.ts db.ts export.ts planReconcile.ts
 │   │   ├── styles/               # main.css
 │   │   ├── App.vue main.ts env.d.ts
 │   ├── public/favicon.svg
@@ -118,15 +124,24 @@ sologsb101-1019/
 └── README.md
 ```
 
-分层约定：页面只读 Pinia store，跨页状态不留在组件内部 `ref`；IndexedDB 读写统一走 `useIdbTable()`（`liveQuery` 响应式订阅）；筛选条件与 URL query 通过 `FilterBar.vue` 导出的 `useFilterQuery()` 同步。
+分层约定：页面只读 Pinia store，跨页状态不留在组件内部 `ref`；IndexedDB 读写统一走 `useIdbTable()`（`liveQuery` 响应式订阅）；筛选条件与 URL query 通过 `FilterBar.vue` 导出的 `useFilterQuery()` 同步；方案与实做的对账口径集中在 `utils/planReconcile.ts`（纯函数，升级迁移与页面共用）。
+
+### 方案、偏离与归档对账规则（v3 核心）
+
+- **先立方案再动手**：由修复室主管在 `/plans` 按册次写清**目标 pH、打算用哪种补纸、走哪几道工序、预计哪天完工**。草稿只有主管能改；**方案定稿后主管自己也改不了，想改只能「作废重立」**（必须写作废原因，`revision` 自动 +1）；修复师动不了方案，也不能在没定稿方案的册次上排工序 / 选配补纸。
+- **出入就补偏离**：修复师手上实做与方案有出入（pH / 补纸 / 工序 / 工期四类），必须在生效方案上**补一条偏离说明**（方案要求、实做情况、原因），主管对账后可补认定结论。
+- **归档前逐项对账**：`/plans` 与 `/export` 都把方案四项与该册实做一项项对账——对得上＝`match`，对不上但已登记偏离＝`covered`，**对不上又没登记＝`held` 先挂起**。存在挂起项（或工序未完成、方案缺失/草稿/作废、旧档只读）时，即使装订验收点「合格」也**不许归档**，必须由修复师补偏离或按方案返工。
+- **角色模拟**：纯前端无登录，页头可在「修复室主管 / 修复师」身份间切换（localStorage 记忆），两边权限互相牵制。
+- **旧数据升级**：见数据模型一节的 v2→v3 迁移说明（回填历史方案或置只读）。
 
 ---
 
 ## 七、数据存储说明
 
-- **IndexedDB（Dexie，数据库名 `gbbookrestore`）**：6 张业务表 `books` / `volumes` / `leaves` / `papers` / `repairOrders` / `bindings`，由 `src/utils/db.ts` 统一定义 schema、版本号与升级迁移；`initDatabase()` 首次打开时自动播种**三层互相引用**的演示数据（Book → Volume → Leaf → Paper / RepairOrder，另有 Volume → Binding，固定 id 如 `book_01`、`vol_0101`、`leaf_010101`），保证 `/books/:id/leaves` 深链能命中真实 id，播种幂等。
-- **localStorage**：仅存元数据 —— `gbbookrestore:db-version`（本地结构版本）、`gbbookrestore:last-backup-at`（最近导出时间）、`gbbookrestore:ui-prefs`（当前古籍 / 册次、工序排序方式）。
-- **备份**：`/export` 页可导出 JSON（6 张表全量数据 + 结构版本号），导入时校验 `app` 字段与各集合数组完整性，覆盖导入前二次确认；另有归档清单 TXT 与书叶破损台账 CSV。
+- **IndexedDB（Dexie，数据库名 `gbbookrestore`）**：8 张业务表 `books` / `volumes` / `leaves` / `papers` / `repairOrders` / `bindings` / `repairPlans` / `deviations`，由 `src/utils/db.ts` 统一定义 schema、版本号与升级迁移；`initDatabase()` 首次打开时自动播种**三层互相引用**的演示数据（Book → Volume → Leaf → Paper / RepairOrder，另有 Volume → Binding / RepairPlan → Deviation，固定 id 如 `book_01`、`vol_0101`、`leaf_010101`、`plan_0101`），保证 `/books/:id/leaves` 深链能命中真实 id，播种幂等。
+- **localStorage**：仅存元数据 —— `gbbookrestore:db-version`（本地结构版本）、`gbbookrestore:last-backup-at`（最近导出时间）、`gbbookrestore:ui-prefs`（当前古籍 / 册次、工序排序方式）、`gbbookrestore:role`（当前身份：主管 / 修复师）。
+- **备份**：`/export` 页可导出 JSON（8 张表全量数据 + 结构版本号），导入时校验 `app` 字段与各集合数组完整性，覆盖导入前二次确认；另有归档清单 TXT（含修复方案与偏离说明）与书叶破损台账 CSV。
+- **冒烟测试**：`npm run smoke` 用 fake-indexeddb 在 Node 侧验证 v2→v3 历史方案回填（含补不上置只读）与对账 / 归档闸门。
 - **隐私与无状态**：数据不上传任何服务器，容器不挂载命名卷；清理浏览器站点数据或更换浏览器会丢失档案，请定期导出备份。
 
 ---

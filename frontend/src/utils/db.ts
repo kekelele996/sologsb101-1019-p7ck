@@ -1,7 +1,10 @@
 /**
  * IndexedDB 持久化层（Dexie 封装）
- * - 数据结构版本号与升级迁移逻辑（v1 → v2：Paper 增加 dyeRecipe 字段并按纸种回填默认配方）
- * - 六张业务表的增删改查与整库导入导出
+ * - 数据结构版本号与升级迁移逻辑：
+ *   v1 → v2：Paper 增加 dyeRecipe 字段并按纸种回填默认配方；
+ *   v2 → v3：新增修复方案 repairPlans / 偏离说明 deviations 两表，
+ *            旧册按现有配纸与工序回填历史方案（historical 只读），补不上的册次置 legacyReadOnly 只读。
+ * - 八张业务表的增删改查与整库导入导出
  * - 首次打开自动播种三层互相引用的演示数据（幂等）
  * 纯前端应用：不依赖任何后端服务或数据库。
  */
@@ -12,12 +15,15 @@ import type { Leaf } from '@/types/leaf'
 import { DEFAULT_DYE_RECIPE, type Paper } from '@/types/paper'
 import type { RepairOrder } from '@/types/repairOrder'
 import type { Binding } from '@/types/binding'
+import type { RepairPlan, RepairPlanDraft } from '@/types/repairPlan'
+import type { Deviation } from '@/types/deviation'
+import { buildHistoricalPlan } from '@/utils/planReconcile'
 
 /** 数据库名（README 与导出文件均使用该名称） */
 export const DB_NAME = 'gbbookrestore'
 
 /** 当前数据结构版本号 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** localStorage 侧少量元数据键 */
 export const LS_KEYS = {
@@ -88,6 +94,8 @@ export class BookRestoreDatabase extends Dexie {
   papers!: Table<Paper, string>
   repairOrders!: Table<RepairOrder, string>
   bindings!: Table<Binding, string>
+  repairPlans!: Table<RepairPlan, string>
+  deviations!: Table<Deviation, string>
 
   constructor() {
     super(DB_NAME)
@@ -101,7 +109,7 @@ export class BookRestoreDatabase extends Dexie {
       bindings: 'id, volumeId, verdict, finishDate, updatedAt'
     })
     // v2：Paper 增加 dyeRecipe 字段，按纸种为历史记录回填默认配方
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         books: 'id, title, era, level, collectionNo, updatedAt',
         volumes: 'id, bookId, volumeNo, bindingType, state, updatedAt',
@@ -121,6 +129,58 @@ export class BookRestoreDatabase extends Dexie {
             if (typeof paper.deltaE !== 'number') paper.deltaE = 2
             if (typeof paper.thicknessMm !== 'number') paper.thicknessMm = 0.06
           })
+      })
+    // v3：新增修复方案 / 偏离说明两表；
+    //     旧数据没方案，按现有配纸与工序回填一份历史方案，补不上的册次置只读。
+    this.version(DB_VERSION)
+      .stores({
+        books: 'id, title, era, level, collectionNo, updatedAt',
+        volumes: 'id, bookId, volumeNo, bindingType, state, updatedAt',
+        leaves: 'id, volumeId, leafNo, damageType, phValue, state, updatedAt',
+        papers: 'id, leafId, paperType, laidPattern, deltaE, updatedAt',
+        repairOrders: 'id, leafId, seq, name, operator, state, updatedAt',
+        bindings: 'id, volumeId, method, verdict, finishDate, updatedAt',
+        repairPlans: 'id, volumeId, revision, state, historical, updatedAt',
+        deviations: 'id, volumeId, planId, kind, status, date, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        const volumes = await tx.table<Volume>('volumes').toArray()
+        const leaves = await tx.table<Leaf>('leaves').toArray()
+        const papers = await tx.table<Paper>('papers').toArray()
+        const orders = await tx.table<RepairOrder>('repairOrders').toArray()
+        const bindings = await tx.table<Binding>('bindings').toArray()
+        const now = Date.now()
+
+        for (const volume of volumes) {
+          const volumeLeaves = leaves.filter((leaf) => leaf.volumeId === volume.id)
+          const leafIds = new Set(volumeLeaves.map((leaf) => leaf.id))
+          const draft = buildHistoricalPlan({
+            volumeId: volume.id,
+            leaves: volumeLeaves,
+            papers: papers.filter((paper) => leafIds.has(paper.leafId)),
+            orders: orders.filter((order) => leafIds.has(order.leafId)),
+            binding: bindings.find((binding) => binding.volumeId === volume.id)
+          })
+          if (!draft) {
+            // 补不上：只读留着
+            await tx
+              .table<Volume>('volumes')
+              .update(volume.id, { legacyReadOnly: true, updatedAt: now } as never)
+            continue
+          }
+          await tx.table<RepairPlan>('repairPlans').put({
+            ...draft,
+            id: `plan_hist_${volume.id}`,
+            revision: 1,
+            state: 'confirmed',
+            historical: true,
+            confirmedAt: volume.createdAt ?? now,
+            voidedAt: null,
+            voidReason: '',
+            createdAt: volume.createdAt ?? now,
+            updatedAt: now
+          })
+        }
       })
   }
 }
@@ -177,7 +237,7 @@ export async function seedDatabase(): Promise<void> {
       title: '重刊巢氏诸病源候总论',
       edition: '元至正刻本（残）',
       era: '元',
-      volumeCount: 1,
+      volumeCount: 2,
       collectionNo: 'GJ-0008',
       level: 'first',
       createdAt: now - day * 60,
@@ -189,7 +249,9 @@ export async function seedDatabase(): Promise<void> {
     { id: 'vol_0101', bookId: 'book_01', volumeNo: 1, leafCount: 24, bindingType: 'thread', state: 'repairing', createdAt: now - day * 38, updatedAt: now - day * 3 },
     { id: 'vol_0102', bookId: 'book_01', volumeNo: 2, leafCount: 18, bindingType: 'wrapped', state: 'pending', createdAt: now - day * 38, updatedAt: now - day * 6 },
     { id: 'vol_0201', bookId: 'book_02', volumeNo: 1, leafCount: 30, bindingType: 'thread', state: 'archived', createdAt: now - day * 30, updatedAt: now - day * 2 },
-    { id: 'vol_0301', bookId: 'book_03', volumeNo: 1, leafCount: 12, bindingType: 'butterfly', state: 'archived', createdAt: now - day * 55, updatedAt: now - day * 5 }
+    { id: 'vol_0301', bookId: 'book_03', volumeNo: 1, leafCount: 12, bindingType: 'butterfly', state: 'archived', createdAt: now - day * 55, updatedAt: now - day * 5 },
+    // 旧档示例：有破损台账，但从未选配补纸 / 登记工序，升级时补不出历史方案 → 只读留着
+    { id: 'vol_0302', bookId: 'book_03', volumeNo: 2, leafCount: 6, bindingType: 'thread', state: 'pending', legacyReadOnly: true, createdAt: now - day * 58, updatedAt: now - day * 5 }
   ]
 
   const leaves: Leaf[] = [
@@ -200,7 +262,8 @@ export async function seedDatabase(): Promise<void> {
     { id: 'leaf_020101', volumeId: 'vol_0201', leafNo: 5, damageType: 'fibrin', damageAreaCm2: 15.6, phValue: 6.9, state: 'repaired', createdAt: now - day * 25, updatedAt: now - day * 2 },
     { id: 'leaf_020102', volumeId: 'vol_0201', leafNo: 11, damageType: 'worm', damageAreaCm2: 7.2, phValue: 6.6, state: 'repaired', createdAt: now - day * 24, updatedAt: now - day * 3 },
     { id: 'leaf_030101', volumeId: 'vol_0301', leafNo: 1, damageType: 'acid', damageAreaCm2: 20.5, phValue: 4.8, state: 'repaired', createdAt: now - day * 50, updatedAt: now - day * 5 },
-    { id: 'leaf_030102', volumeId: 'vol_0301', leafNo: 6, damageType: 'loss', damageAreaCm2: 11.1, phValue: 5.6, state: 'repaired', createdAt: now - day * 49, updatedAt: now - day * 6 }
+    { id: 'leaf_030102', volumeId: 'vol_0301', leafNo: 6, damageType: 'loss', damageAreaCm2: 11.1, phValue: 5.6, state: 'repaired', createdAt: now - day * 49, updatedAt: now - day * 6 },
+    { id: 'leaf_030201', volumeId: 'vol_0302', leafNo: 2, damageType: 'acid', damageAreaCm2: 8.8, phValue: 5.4, state: 'pending', createdAt: now - day * 52, updatedAt: now - day * 7 }
   ]
 
   const papers: Paper[] = [
@@ -230,9 +293,107 @@ export async function seedDatabase(): Promise<void> {
     { id: 'bind_0101', volumeId: 'vol_0101', method: '四眼线装', finishDate: '2026-03-10', verdict: 'rework', inspector: '程砚', createdAt: now - day * 2, updatedAt: now - day * 2 }
   ]
 
+  /* 修复方案：主管按册先立方案，定稿后不可改、只能作废重立 */
+  const plan0201 = buildHistoricalPlan({
+    volumeId: 'vol_0201',
+    leaves: leaves.filter((leaf) => leaf.volumeId === 'vol_0201'),
+    papers: papers.filter((paper) => paper.leafId.startsWith('leaf_0201')),
+    orders: repairOrders.filter((order) => order.leafId.startsWith('leaf_0201')),
+    binding: bindings.find((binding) => binding.volumeId === 'vol_0201')
+  }) as RepairPlanDraft
+  const plan0301 = buildHistoricalPlan({
+    volumeId: 'vol_0301',
+    leaves: leaves.filter((leaf) => leaf.volumeId === 'vol_0301'),
+    papers: papers.filter((paper) => paper.leafId.startsWith('leaf_0301')),
+    orders: repairOrders.filter((order) => order.leafId.startsWith('leaf_0301')),
+    binding: bindings.find((binding) => binding.volumeId === 'vol_0301')
+  }) as RepairPlanDraft
+
+  const repairPlans: RepairPlan[] = [
+    {
+      id: 'plan_0101',
+      volumeId: 'vol_0101',
+      revision: 1,
+      targetPh: 6.5,
+      paperType: 'bamboo',
+      steps: ['mend', 'mount', 'press'],
+      plannedFinishDate: '2026-03-08',
+      remark: '虫蛀为主，先补破再托裱；脱酸目标 pH 不低于 6.5。',
+      state: 'confirmed',
+      supervisor: '周知白',
+      historical: false,
+      confirmedAt: now - day * 17,
+      voidedAt: null,
+      voidReason: '',
+      createdAt: now - day * 18,
+      updatedAt: now - day * 17
+    },
+    {
+      id: 'plan_0102',
+      volumeId: 'vol_0102',
+      revision: 1,
+      targetPh: 7.0,
+      paperType: 'xuan',
+      steps: ['mend', 'mount', 'corner', 'trim', 'press'],
+      plannedFinishDate: '2026-03-25',
+      remark: '缺肉面积较大，拟用宣纸软补；草稿，待主管会商定稿。',
+      state: 'draft',
+      supervisor: '周知白',
+      historical: false,
+      confirmedAt: null,
+      voidedAt: null,
+      voidReason: '',
+      createdAt: now - day * 7,
+      updatedAt: now - day * 7
+    },
+    {
+      id: 'plan_hist_0201',
+      ...plan0201,
+      revision: 1,
+      state: 'confirmed',
+      historical: true,
+      confirmedAt: now - day * 30,
+      voidedAt: null,
+      voidReason: '',
+      createdAt: now - day * 30,
+      updatedAt: now - day * 3
+    },
+    {
+      id: 'plan_hist_0301',
+      ...plan0301,
+      revision: 1,
+      state: 'confirmed',
+      historical: true,
+      confirmedAt: now - day * 55,
+      voidedAt: null,
+      voidReason: '',
+      createdAt: now - day * 55,
+      updatedAt: now - day * 5
+    }
+  ]
+
+  /* 偏离说明：实做与方案有出入就得登记，归档对账时按类别覆盖挂起项 */
+  const deviations: Deviation[] = [
+    {
+      id: 'dev_010101',
+      volumeId: 'vol_0101',
+      planId: 'plan_0101',
+      kind: 'schedule',
+      planned: '预计 2026-03-08 完工',
+      actual: '截至 2026-03-04 仅补破一道完成，托裱进行中，预计延至 2026-03-12',
+      reason: '托裱上墙后近日空气湿度偏高，自然阴干比预估慢，避免抢工起壳。',
+      recorder: '沈玉',
+      resolution: '',
+      status: 'open',
+      date: '2026-03-05',
+      createdAt: now - day * 3,
+      updatedAt: now - day * 3
+    }
+  ]
+
   await db.transaction(
     'rw',
-    [db.books, db.volumes, db.leaves, db.papers, db.repairOrders, db.bindings],
+    [db.books, db.volumes, db.leaves, db.papers, db.repairOrders, db.bindings, db.repairPlans, db.deviations],
     async () => {
       await db.books.bulkPut(books)
       await db.volumes.bulkPut(volumes)
@@ -240,6 +401,8 @@ export async function seedDatabase(): Promise<void> {
       await db.papers.bulkPut(papers)
       await db.repairOrders.bulkPut(repairOrders)
       await db.bindings.bulkPut(bindings)
+      await db.repairPlans.bulkPut(repairPlans)
+      await db.deviations.bulkPut(deviations)
     }
   )
 }
@@ -256,16 +419,20 @@ export interface RestoreSnapshot {
   papers: Paper[]
   repairOrders: RepairOrder[]
   bindings: Binding[]
+  repairPlans: RepairPlan[]
+  deviations: Deviation[]
 }
 
 export async function exportSnapshot(): Promise<RestoreSnapshot> {
-  const [books, volumes, leaves, papers, repairOrders, bindings] = await Promise.all([
+  const [books, volumes, leaves, papers, repairOrders, bindings, repairPlans, deviations] = await Promise.all([
     db.books.toArray(),
     db.volumes.toArray(),
     db.leaves.toArray(),
     db.papers.toArray(),
     db.repairOrders.toArray(),
-    db.bindings.toArray()
+    db.bindings.toArray(),
+    db.repairPlans.toArray(),
+    db.deviations.toArray()
   ])
   return {
     app: DB_NAME,
@@ -276,7 +443,9 @@ export async function exportSnapshot(): Promise<RestoreSnapshot> {
     leaves,
     papers,
     repairOrders,
-    bindings
+    bindings,
+    repairPlans,
+    deviations
   }
 }
 
@@ -291,7 +460,9 @@ export function validateSnapshot(input: unknown): string {
     'leaves',
     'papers',
     'repairOrders',
-    'bindings'
+    'bindings',
+    'repairPlans',
+    'deviations'
   ]
   for (const key of keys) {
     if (!Array.isArray(snapshot[key])) return `备份文件缺少 ${String(key)} 集合`
@@ -302,7 +473,7 @@ export function validateSnapshot(input: unknown): string {
 export async function importSnapshot(snapshot: RestoreSnapshot): Promise<void> {
   await db.transaction(
     'rw',
-    [db.books, db.volumes, db.leaves, db.papers, db.repairOrders, db.bindings],
+    [db.books, db.volumes, db.leaves, db.papers, db.repairOrders, db.bindings, db.repairPlans, db.deviations],
     async () => {
       await Promise.all([
         db.books.clear(),
@@ -310,7 +481,9 @@ export async function importSnapshot(snapshot: RestoreSnapshot): Promise<void> {
         db.leaves.clear(),
         db.papers.clear(),
         db.repairOrders.clear(),
-        db.bindings.clear()
+        db.bindings.clear(),
+        db.repairPlans.clear(),
+        db.deviations.clear()
       ])
       await db.books.bulkPut(snapshot.books)
       await db.volumes.bulkPut(snapshot.volumes)
@@ -318,6 +491,8 @@ export async function importSnapshot(snapshot: RestoreSnapshot): Promise<void> {
       await db.papers.bulkPut(snapshot.papers)
       await db.repairOrders.bulkPut(snapshot.repairOrders)
       await db.bindings.bulkPut(snapshot.bindings)
+      await db.repairPlans.bulkPut(snapshot.repairPlans)
+      await db.deviations.bulkPut(snapshot.deviations)
     }
   )
 }
@@ -325,7 +500,7 @@ export async function importSnapshot(snapshot: RestoreSnapshot): Promise<void> {
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.books, db.volumes, db.leaves, db.papers, db.repairOrders, db.bindings],
+    [db.books, db.volumes, db.leaves, db.papers, db.repairOrders, db.bindings, db.repairPlans, db.deviations],
     async () => {
       await Promise.all([
         db.books.clear(),
@@ -333,7 +508,9 @@ export async function clearAllTables(): Promise<void> {
         db.leaves.clear(),
         db.papers.clear(),
         db.repairOrders.clear(),
-        db.bindings.clear()
+        db.bindings.clear(),
+        db.repairPlans.clear(),
+        db.deviations.clear()
       ])
     }
   )
@@ -345,18 +522,20 @@ export async function resetDatabase(): Promise<void> {
 }
 
 export async function countAll(): Promise<Record<string, number>> {
-  const [books, volumes, leaves, papers, repairOrders, bindings] = await Promise.all([
+  const [books, volumes, leaves, papers, repairOrders, bindings, repairPlans, deviations] = await Promise.all([
     db.books.count(),
     db.volumes.count(),
     db.leaves.count(),
     db.papers.count(),
     db.repairOrders.count(),
-    db.bindings.count()
+    db.bindings.count(),
+    db.repairPlans.count(),
+    db.deviations.count()
   ])
-  return { books, volumes, leaves, papers, repairOrders, bindings }
+  return { books, volumes, leaves, papers, repairOrders, bindings, repairPlans, deviations }
 }
 
-/** 级联删除古籍 → 册次 → 书叶 → 补纸 / 工序 / 装订 */
+/** 级联删除古籍 → 册次 → 书叶 → 补纸 / 工序 / 装订 / 方案 / 偏离 */
 export async function removeBookCascade(bookId: string): Promise<void> {
   const volumeIds = (await db.volumes.where('bookId').equals(bookId).toArray()).map((row) => row.id)
   const leafIds = volumeIds.length
@@ -364,7 +543,7 @@ export async function removeBookCascade(bookId: string): Promise<void> {
     : []
   await db.transaction(
     'rw',
-    [db.books, db.volumes, db.leaves, db.papers, db.repairOrders, db.bindings],
+    [db.books, db.volumes, db.leaves, db.papers, db.repairOrders, db.bindings, db.repairPlans, db.deviations],
     async () => {
       if (leafIds.length > 0) {
         await db.papers.where('leafId').anyOf(leafIds).delete()
@@ -373,6 +552,8 @@ export async function removeBookCascade(bookId: string): Promise<void> {
       if (volumeIds.length > 0) {
         await db.leaves.where('volumeId').anyOf(volumeIds).delete()
         await db.bindings.where('volumeId').anyOf(volumeIds).delete()
+        await db.deviations.where('volumeId').anyOf(volumeIds).delete()
+        await db.repairPlans.where('volumeId').anyOf(volumeIds).delete()
       }
       await db.volumes.where('bookId').equals(bookId).delete()
       await db.books.delete(bookId)
@@ -380,12 +561,12 @@ export async function removeBookCascade(bookId: string): Promise<void> {
   )
 }
 
-/** 级联删除册次 → 书叶 → 补纸 / 工序 / 装订 */
+/** 级联删除册次 → 书叶 → 补纸 / 工序 / 装订 / 方案 / 偏离 */
 export async function removeVolumeCascade(volumeId: string): Promise<void> {
   const leafIds = (await db.leaves.where('volumeId').equals(volumeId).toArray()).map((row) => row.id)
   await db.transaction(
     'rw',
-    [db.volumes, db.leaves, db.papers, db.repairOrders, db.bindings],
+    [db.volumes, db.leaves, db.papers, db.repairOrders, db.bindings, db.repairPlans, db.deviations],
     async () => {
       if (leafIds.length > 0) {
         await db.papers.where('leafId').anyOf(leafIds).delete()
@@ -393,6 +574,8 @@ export async function removeVolumeCascade(volumeId: string): Promise<void> {
       }
       await db.leaves.where('volumeId').equals(volumeId).delete()
       await db.bindings.where('volumeId').equals(volumeId).delete()
+      await db.deviations.where('volumeId').equals(volumeId).delete()
+      await db.repairPlans.where('volumeId').equals(volumeId).delete()
       await db.volumes.delete(volumeId)
     }
   )

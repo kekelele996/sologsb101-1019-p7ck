@@ -8,12 +8,17 @@ import type { Leaf } from '@/types/leaf'
 import type { Paper } from '@/types/paper'
 import type { RepairOrder } from '@/types/repairOrder'
 import type { Binding } from '@/types/binding'
+import type { RepairPlan } from '@/types/repairPlan'
+import type { Deviation } from '@/types/deviation'
 import { BOOK_LEVEL_LABEL } from '@/types/book'
 import { BINDING_TYPE_LABEL, VOLUME_STATE_LABEL } from '@/types/volume'
 import { DAMAGE_TYPE_LABEL, LEAF_STATE_LABEL } from '@/types/leaf'
 import { PAPER_TYPE_LABEL, deltaELevel } from '@/types/paper'
 import { REPAIR_NAME_LABEL } from '@/types/repairOrder'
 import { BINDING_VERDICT_LABEL } from '@/types/binding'
+import { PLAN_STATE_LABEL } from '@/types/repairPlan'
+import { DEVIATION_KIND_LABEL, DEVIATION_STATUS_LABEL } from '@/types/deviation'
+import { effectivePlan } from './planReconcile'
 import type { RestoreSnapshot } from './db'
 
 /** 触发浏览器下载 */
@@ -55,9 +60,11 @@ export interface ExportContext {
   papers: Paper[]
   repairOrders: RepairOrder[]
   bindings: Binding[]
+  repairPlans: RepairPlan[]
+  deviations: Deviation[]
 }
 
-/** 验收归档清单文本：按古籍 → 册次 → 书叶 → 工序展开 */
+/** 验收归档清单文本：按古籍 → 册次 → 方案 / 偏离 → 书叶 → 工序展开 */
 export function buildArchiveReport(context: ExportContext): string {
   const lines: string[] = ['古籍修复验收归档清单', `生成时间：${new Date().toLocaleString('zh-CN')}`, '']
   if (context.books.length === 0) {
@@ -75,8 +82,29 @@ export function buildArchiveReport(context: ExportContext): string {
       const averagePh =
         leaves.length === 0 ? 0 : Math.round((leaves.reduce((sum, leaf) => sum + leaf.phValue, 0) / leaves.length) * 100) / 100
       lines.push(
-        `   第 ${volume.volumeNo} 册　${BINDING_TYPE_LABEL[volume.bindingType]}　${VOLUME_STATE_LABEL[volume.state]}　叶数 ${volume.leafCount}　破损 ${totalArea} cm²　平均 pH ${averagePh}`
+        `   第 ${volume.volumeNo} 册　${BINDING_TYPE_LABEL[volume.bindingType]}　${VOLUME_STATE_LABEL[volume.state]}${volume.legacyReadOnly ? '（旧档只读）' : ''}　叶数 ${volume.leafCount}　破损 ${totalArea} cm²　平均 pH ${averagePh}`
       )
+      // 修复方案与偏离说明：归档时方案与实做必须一项项对得上账
+      const plan = effectivePlan(context.repairPlans, volume.id)
+      if (plan) {
+        lines.push(
+          `      修复方案（第 ${plan.revision} 版·${PLAN_STATE_LABEL[plan.state]}${plan.historical ? '·历史回填' : ''}）：目标 pH ${plan.targetPh.toFixed(1)}　补纸 ${PAPER_TYPE_LABEL[plan.paperType]}　工序 ${plan.steps
+            .map((name) => REPAIR_NAME_LABEL[name])
+            .join('、')}　预计完工 ${plan.plannedFinishDate}　主管 ${plan.supervisor}`
+        )
+      } else {
+        lines.push('      修复方案：尚未立方案')
+      }
+      const deviations = context.deviations
+        .filter((item) => item.volumeId === volume.id)
+        .sort((a, b) => a.date.localeCompare(b.date))
+      deviations.forEach((deviation) => {
+        lines.push(
+          `      偏离说明〔${DEVIATION_KIND_LABEL[deviation.kind]}·${DEVIATION_STATUS_LABEL[deviation.status]}〕：方案「${deviation.planned}」/ 实做「${deviation.actual}」——${deviation.reason}（${deviation.recorder}，${deviation.date}）${
+            deviation.resolution ? `　主管认定：${deviation.resolution}` : ''
+          }`
+        )
+      })
       lines.push(
         `      装订验收：${
           binding

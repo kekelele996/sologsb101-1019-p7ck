@@ -5,6 +5,7 @@
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 import { createId, db, removeLeafCascade } from '@/utils/db'
+import { useBookStore } from '@/stores/bookStore'
 import {
   nextLeafState,
   type DamageType,
@@ -12,6 +13,14 @@ import {
   type LeafDraft,
   type LeafState
 } from '@/types/leaf'
+
+/** 旧档只读 / 装订锁定的册次不能再改动书叶台账 */
+function assertVolumeWritableForLeaf(volumeId: string): void {
+  const volume = useBookStore().volumeById(volumeId)
+  if (!volume) throw new Error('册次不存在或已删除')
+  if (volume.legacyReadOnly === true) throw new Error('该册是补不出历史方案的旧档，只读留着')
+  if (volume.state === 'bound' || volume.state === 'archived') throw new Error('该册已装订 / 归档锁定，书叶只读')
+}
 
 export interface LeafFilters {
   keyword: string
@@ -99,6 +108,7 @@ export const useLeafStore = defineStore('leaf', () => {
   }
 
   async function createLeaf(draft: LeafDraft): Promise<Leaf> {
+    assertVolumeWritableForLeaf(draft.volumeId)
     const now = Date.now()
     const row: Leaf = { ...draft, id: createId('leaf'), createdAt: now, updatedAt: now }
     await db.leaves.put(row)
@@ -107,17 +117,23 @@ export const useLeafStore = defineStore('leaf', () => {
   }
 
   async function updateLeaf(id: string, patch: Partial<Leaf>): Promise<void> {
+    const existing = leaves.value.find((leaf) => leaf.id === id)
+    if (existing) assertVolumeWritableForLeaf(existing.volumeId)
     await db.leaves.update(id, { ...patch, updatedAt: Date.now() } as never)
     await loadLeaves()
   }
 
   async function removeLeaf(id: string): Promise<void> {
+    const existing = leaves.value.find((leaf) => leaf.id === id)
+    if (existing) assertVolumeWritableForLeaf(existing.volumeId)
     await removeLeafCascade(id)
     await loadLeaves()
   }
 
   async function batchUpdate(ids: string[], patch: Partial<Leaf>): Promise<void> {
     if (ids.length === 0) return
+    const first = leaves.value.find((leaf) => ids.includes(leaf.id))
+    if (first) assertVolumeWritableForLeaf(first.volumeId)
     const now = Date.now()
     const rows = leaves.value.filter((leaf) => ids.includes(leaf.id)).map((leaf) => ({ ...leaf, ...patch, updatedAt: now }))
     await db.leaves.bulkPut(rows)

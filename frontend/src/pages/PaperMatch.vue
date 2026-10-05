@@ -12,6 +12,8 @@ import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import FilterBar, { useFilterQuery, type FilterModel } from '@/components/common/FilterBar.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import { useIdbTable } from '@/hooks/useIdbTable'
+import { usePlanReconcile } from '@/hooks/usePlanReconcile'
+import { assertVolumeWritableForRepair } from '@/stores/repairStore'
 import { useBookStore } from '@/stores/bookStore'
 import { useLeafStore } from '@/stores/leafStore'
 import {
@@ -39,6 +41,26 @@ import {
 const bookStore = useBookStore()
 const leafStore = useLeafStore()
 const paperTable = useIdbTable<Paper>((database) => database.papers, { sortByUpdatedAt: false })
+const { reconcileOf } = usePlanReconcile()
+
+/** 书叶 → 是否允许选配补纸（该册必须有定稿方案且未锁定） */
+function paperWritable(leafId: string | undefined): boolean {
+  if (!leafId) return false
+  const leaf = leafStore.leafById(leafId)
+  if (!leaf) return false
+  try {
+    assertVolumeWritableForRepair(leaf.volumeId)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** 右侧候选书叶所在册的方案状态横幅 */
+const candidateVolumeId = computed(() =>
+  candidateLeafId.value ? leafStore.leafById(candidateLeafId.value)?.volumeId ?? '' : ''
+)
+const candidatePlan = computed(() => (candidateVolumeId.value ? reconcileOf(candidateVolumeId.value).plan : null))
 
 const FILTER_KEYS = ['paperType', 'laidPattern'] as const
 const url = useFilterQuery(FILTER_KEYS)
@@ -140,12 +162,20 @@ function openCreate(): void {
     ElMessage.warning('请先登记书叶')
     return
   }
+  if (!paperWritable(firstLeaf.value)) {
+    ElMessage.warning('该册尚无定稿方案（或已锁定 / 旧档只读），请先到「修复方案」页立方案')
+    return
+  }
   editing.value = null
   Object.assign(form, createEmptyPaperDraft(firstLeaf.value))
   dialog.value = true
 }
 
 function openEdit(paper: Paper): void {
+  if (!paperWritable(paper.leafId)) {
+    ElMessage.warning('该册已锁定 / 旧档只读，补纸记录只读')
+    return
+  }
   editing.value = paper
   Object.assign(form, {
     leafId: paper.leafId,
@@ -177,17 +207,29 @@ async function submit(): Promise<void> {
     ElMessage.warning('请选择关联书叶')
     return
   }
-  if (editing.value) {
-    await paperTable.update(editing.value.id, { ...form })
-    ElMessage.success('已更新补纸记录')
-  } else {
-    await paperTable.create({ ...form }, 'paper')
-    ElMessage.success(needRedye(form.deltaE) ? '已新增补纸，色差超阈值需重新染色' : '已新增补纸记录')
+  if (!paperWritable(form.leafId)) {
+    ElMessage.warning('该册尚无定稿方案（或已锁定 / 旧档只读），不能选配补纸')
+    return
   }
-  dialog.value = false
+  try {
+    if (editing.value) {
+      await paperTable.update(editing.value.id, { ...form })
+      ElMessage.success('已更新补纸记录')
+    } else {
+      await paperTable.create({ ...form }, 'paper')
+      ElMessage.success(needRedye(form.deltaE) ? '已新增补纸，色差超阈值需重新染色' : '已新增补纸记录')
+    }
+    dialog.value = false
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : '保存失败')
+  }
 }
 
 async function remove(paper: Paper): Promise<void> {
+  if (!paperWritable(paper.leafId)) {
+    ElMessage.warning('该册已锁定 / 旧档只读，不能删除补纸记录')
+    return
+  }
   try {
     await ElMessageBox.confirm('将删除该补纸选配记录。', '删除补纸', {
       type: 'warning',
@@ -234,6 +276,10 @@ const candidateLeafPattern = computed(() =>
 
 async function selectCandidate(type: PaperType, deltaE: number, laidPatternValue: string, thicknessMm: number): Promise<void> {
   if (!candidateLeafId.value) return
+  if (!paperWritable(candidateLeafId.value)) {
+    ElMessage.warning('该册尚无定稿方案（或已锁定 / 旧档只读），不能采用候选补纸')
+    return
+  }
   const existing = paperTable.rows.value.find(
     (item) => item.leafId === candidateLeafId.value && item.paperType === type
   )
@@ -349,8 +395,8 @@ function deltaTag(deltaE: number): { label: string; color: string } {
             </el-table-column>
             <el-table-column label="操作" width="150">
               <template #default="{ row }">
-                <el-button size="small" text :icon="Edit" @click="openEdit(row)">编辑</el-button>
-                <el-button size="small" text type="danger" :icon="Delete" @click="remove(row)">删除</el-button>
+                <el-button size="small" text :disabled="!paperWritable(row.leafId)" :icon="Edit" @click="openEdit(row)">编辑</el-button>
+                <el-button size="small" text type="danger" :disabled="!paperWritable(row.leafId)" :icon="Delete" @click="remove(row)">删除</el-button>
               </template>
             </el-table-column>
           </el-table>
@@ -363,6 +409,25 @@ function deltaTag(deltaE: number): { label: string; color: string } {
           <el-select v-model="candidateLeafId" placeholder="选择需要配纸的书叶" style="width: 100%; margin-bottom: 10px">
             <el-option v-for="item in leafOptions" :key="item.value" :label="item.label" :value="item.value" />
           </el-select>
+
+          <el-alert
+            v-if="candidateVolumeId && !candidatePlan"
+            type="warning"
+            show-icon
+            :closable="false"
+            style="margin-bottom: 10px"
+            title="该册尚无定稿方案"
+            description="方案定了才算数：请先由主管在「修复方案」页立方案并定稿，再选配补纸。"
+          />
+          <el-alert
+            v-else-if="candidatePlan"
+            type="success"
+            show-icon
+            :closable="false"
+            style="margin-bottom: 10px"
+            :title="`生效方案：目标 pH ${candidatePlan.targetPh.toFixed(1)} · ${PAPER_TYPE_LABEL[candidatePlan.paperType]}`"
+            :description="candidatePlan.historical ? '历史回填方案，补纸记录只读' : '实做补纸若与方案纸种不一致，记得登记偏离说明'"
+          />
 
           <EmptyPanel
             v-if="candidates.length === 0"
@@ -389,6 +454,7 @@ function deltaTag(deltaE: number): { label: string; color: string } {
               <el-button
                 size="small"
                 style="margin-top: 6px"
+                :disabled="!paperWritable(candidateLeafId)"
                 @click="selectCandidate(item.type, item.deltaE, item.laidPattern, item.thicknessMm)"
               >
                 {{ item.hasRecord ? '更新为采用' : '采用该候选' }}

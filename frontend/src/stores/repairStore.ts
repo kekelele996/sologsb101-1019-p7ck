@@ -6,7 +6,28 @@ import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 import { createId, db, readUiPrefs, writeUiPrefs } from '@/utils/db'
 import { createEmptyOrderDraft, type OrderState, type RepairOrder, type RepairOrderDraft } from '@/types/repairOrder'
+import { useBookStore } from '@/stores/bookStore'
 import { useLeafStore } from './leafStore'
+import { usePlanStore } from './planStore'
+
+/**
+ * 修复实做闸门：方案定稿才算数——
+ * 册次为旧档只读 / 已装订锁定 / 没有定稿方案时，不允许排工序或推进实做。
+ */
+export function assertVolumeWritableForRepair(volumeId: string): void {
+  const bookStore = useBookStore()
+  const planStore = usePlanStore()
+  const volume = bookStore.volumeById(volumeId)
+  if (!volume) throw new Error('册次不存在或已删除')
+  if (volume.legacyReadOnly === true) {
+    throw new Error('该册是升级时补不出历史方案的旧档，只读留着，不能再登记工序')
+  }
+  if (volume.state === 'bound' || volume.state === 'archived') {
+    throw new Error('该册已装订 / 归档锁定，工序只读')
+  }
+  const plan = planStore.activePlanOf(volumeId)
+  if (!plan) throw new Error('该册还没有定稿的修复方案，方案定了才算数；请主管先立方案并定稿')
+}
 
 export const useRepairStore = defineStore('repair', () => {
   const orders = ref<RepairOrder[]>([])
@@ -51,7 +72,14 @@ export const useRepairStore = defineStore('repair', () => {
     return list.length === 0 ? 1 : Math.max(...list.map((order) => order.seq)) + 1
   }
 
+  /** 通过书叶反查所属册次（闸门校验用） */
+  function volumeIdOfLeaf(leafId: string): string | undefined {
+    return useLeafStore().leafById(leafId)?.volumeId
+  }
+
   async function createOrder(draft: RepairOrderDraft): Promise<RepairOrder> {
+    const volumeId = volumeIdOfLeaf(draft.leafId)
+    if (volumeId) assertVolumeWritableForRepair(volumeId)
     const now = Date.now()
     const row: RepairOrder = { ...draft, id: createId('order'), createdAt: now, updatedAt: now }
     await db.repairOrders.put(row)
@@ -61,6 +89,8 @@ export const useRepairStore = defineStore('repair', () => {
 
   /** 按叶生成标准工序序列（补破 → 托裱 → 溜口 → 裁齐 → 压平） */
   async function generateSequence(leafId: string): Promise<number> {
+    const volumeId = volumeIdOfLeaf(leafId)
+    if (volumeId) assertVolumeWritableForRepair(volumeId)
     const existing = ordersOfLeaf(leafId)
     const names: RepairOrderDraft['name'][] = ['mend', 'mount', 'corner', 'trim', 'press']
     let created = 0
@@ -83,12 +113,19 @@ export const useRepairStore = defineStore('repair', () => {
   }
 
   async function updateOrder(id: string, patch: Partial<RepairOrder>): Promise<void> {
+    const target = orders.value.find((order) => order.id === id)
+    const volumeId = target ? volumeIdOfLeaf(target.leafId) : undefined
+    if (volumeId) assertVolumeWritableForRepair(volumeId)
     await db.repairOrders.update(id, { ...patch, updatedAt: Date.now() } as never)
     await loadOrders()
   }
 
   async function removeOrder(id: string): Promise<void> {
     const target = orders.value.find((order) => order.id === id)
+    if (target) {
+      const volumeId = volumeIdOfLeaf(target.leafId)
+      if (volumeId) assertVolumeWritableForRepair(volumeId)
+    }
     await db.repairOrders.delete(id)
     if (target) {
       const rest = orders.value
@@ -102,6 +139,9 @@ export const useRepairStore = defineStore('repair', () => {
 
   async function batchUpdate(ids: string[], patch: Partial<RepairOrder>): Promise<void> {
     if (ids.length === 0) return
+    const first = orders.value.find((order) => ids.includes(order.id))
+    const volumeId = first ? volumeIdOfLeaf(first.leafId) : undefined
+    if (volumeId) assertVolumeWritableForRepair(volumeId)
     const now = Date.now()
     const rows = orders.value.filter((order) => ids.includes(order.id)).map((order) => ({ ...order, ...patch, updatedAt: now }))
     await db.repairOrders.bulkPut(rows)
@@ -110,6 +150,7 @@ export const useRepairStore = defineStore('repair', () => {
 
   /** 拖拽重排：按新顺序落库并重编号 */
   async function reorderOrders(leafId: string, orderedIds: string[]): Promise<void> {
+    assertVolumeWritableForRepair(volumeIdOfLeaf(leafId) ?? '')
     const indexOf = new Map(orderedIds.map((id, index) => [id, index]))
     const rows = orders.value
       .filter((order) => order.leafId === leafId)

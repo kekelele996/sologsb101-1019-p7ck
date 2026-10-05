@@ -10,12 +10,16 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Delete, Edit, Plus, Right } from '@element-plus/icons-vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import FilterBar, { useFilterQuery, type FilterModel } from '@/components/common/FilterBar.vue'
+import PlanTag from '@/components/common/PlanTag.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { useLeafStats } from '@/hooks/useLeafStats'
 import { useBookStore } from '@/stores/bookStore'
 import { useLeafStore } from '@/stores/leafStore'
 import { useRepairStore } from '@/stores/repairStore'
+import { usePlanStore } from '@/stores/planStore'
+import { usePlanReconcile } from '@/hooks/usePlanReconcile'
+import { planStatusForVolume } from '@/utils/planReconcile'
 import {
   BOOK_LEVEL_COLOR,
   BOOK_LEVEL_LABEL,
@@ -34,6 +38,7 @@ import {
   VOLUME_STATE_OPTIONS,
   createEmptyVolumeDraft,
   isVolumeLocked,
+  nextVolumeState,
   type Volume,
   type VolumeDraft
 } from '@/types/volume'
@@ -42,6 +47,8 @@ const router = useRouter()
 const bookStore = useBookStore()
 const leafStore = useLeafStore()
 const repairStore = useRepairStore()
+const planStore = usePlanStore()
+const { gateOf } = usePlanReconcile()
 const { statOf } = useLeafStats()
 const bindingTable = useIdbTable<Binding>((database) => database.bindings, { sortByUpdatedAt: false })
 
@@ -158,6 +165,14 @@ function openEditVolume(volume: Volume): void {
 }
 
 async function submitVolume(): Promise<void> {
+  // 手动把册次直接置为「已归档」同样得过对账闸门：对不上的先挂起，没登记偏离不许归档
+  if (volumeForm.state === 'archived' && editingVolume.value?.state !== 'archived') {
+    const gate = gateOf(volumeForm.bookId)
+    if (!gate.allowed) {
+      ElMessage.error(`不能直接置为已归档：${gate.reasons.join('；')}。请先到「修复方案」页完成对账`)
+      return
+    }
+  }
   if (editingVolume.value) {
     await bookStore.updateVolume(editingVolume.value.id, { ...volumeForm })
     ElMessage.success(`已更新第 ${volumeForm.volumeNo} 册`)
@@ -184,6 +199,18 @@ async function removeVolume(volume: Volume): Promise<void> {
 }
 
 async function advanceVolume(volume: Volume): Promise<void> {
+  if (volume.legacyReadOnly === true) {
+    ElMessage.warning('该册是补不出历史方案的旧档，只读留着，状态不能推进')
+    return
+  }
+  const next = nextVolumeState(volume.state)
+  if (next === 'archived') {
+    const gate = gateOf(volume.id)
+    if (!gate.allowed) {
+      ElMessage.error(`归档被拦住：${gate.reasons.join('；')}`)
+      return
+    }
+  }
   await bookStore.advanceVolumeState(volume.id)
   ElMessage.success(`第 ${volume.volumeNo} 册状态已推进`)
 }
@@ -415,6 +442,12 @@ function bindingLabel(value: string): string {
             >
               {{ volumeStateLabel(row.state) }}
             </el-tag>
+            <el-tag v-if="row.legacyReadOnly" type="info" effect="plain" round size="small" style="margin-top: 4px">旧档只读</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="修复方案" min-width="130">
+          <template #default="{ row }">
+            <PlanTag :status="planStatusForVolume(row, planStore.plans)" size="small" />
           </template>
         </el-table-column>
         <el-table-column label="破损 / 工序" min-width="140">
@@ -425,7 +458,7 @@ function bindingLabel(value: string): string {
         <el-table-column label="操作" width="240">
           <template #default="{ row }">
             <el-button size="small" text type="primary" @click="advanceVolume(row)">推进状态</el-button>
-            <el-button size="small" text :disabled="isVolumeLocked(row.state)" @click="openEditVolume(row)">编辑</el-button>
+            <el-button size="small" text :disabled="isVolumeLocked(row.state, row.legacyReadOnly)" @click="openEditVolume(row)">编辑</el-button>
             <el-button size="small" text type="danger" @click="removeVolume(row)">删除</el-button>
           </template>
         </el-table-column>
