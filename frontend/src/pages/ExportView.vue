@@ -5,6 +5,7 @@
  * 消费 Binding 及全部模型；复用 <StatBadge>、<EmptyPanel>、<DamageTag>。
  */
 import { computed, reactive, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Delete, Download, Edit, Plus, Refresh, Upload } from '@element-plus/icons-vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
@@ -14,6 +15,7 @@ import { useLeafStats } from '@/hooks/useLeafStats'
 import { useBookStore } from '@/stores/bookStore'
 import { useLeafStore } from '@/stores/leafStore'
 import { useRepairStore } from '@/stores/repairStore'
+import { usePlanStore } from '@/stores/planStore'
 import {
   BINDING_METHOD_OPTIONS,
   BINDING_VERDICT_COLOR,
@@ -38,6 +40,11 @@ import {
   type RestoreSnapshot
 } from '@/utils/db'
 import {
+  RECONCILE_STATUS_COLOR,
+  RECONCILE_STATUS_LABEL,
+  reconcileVolume
+} from '@/utils/reconcile'
+import {
   buildArchiveReport,
   copyText,
   exportArchiveReport,
@@ -48,6 +55,8 @@ import {
 const bookStore = useBookStore()
 const leafStore = useLeafStore()
 const repairStore = useRepairStore()
+const planStore = usePlanStore()
+const router = useRouter()
 const { totals } = useLeafStats()
 const bindingTable = useIdbTable<Binding>((database) => database.bindings, { sortByUpdatedAt: false })
 const paperTable = useIdbTable<Paper>((database) => database.papers, { sortByUpdatedAt: false })
@@ -93,10 +102,38 @@ const context = computed(() => ({
   leaves: leafStore.leaves,
   papers: paperTable.rows.value,
   repairOrders: repairStore.orders,
-  bindings: bindingTable.rows.value
+  bindings: bindingTable.rows.value,
+  repairPlans: planStore.plans,
+  deviations: planStore.deviations
 }))
 
 const archiveText = computed(() => buildArchiveReport(context.value))
+
+/* --------------------------- 归档前对账闸门 --------------------------- */
+/** 按方案逐项对账某册（方案 ↔ 书叶 pH / 补纸 / 工序 / 装订完工日） */
+function reconcileOf(volumeId: string) {
+  const leaves = leafStore.leavesOfVolume(volumeId)
+  const leafIds = new Set(leaves.map((leaf) => leaf.id))
+  return reconcileVolume({
+    volumeId,
+    plans: planStore.plans,
+    deviations: planStore.deviations,
+    leaves,
+    papers: paperTable.rows.value.filter((paper) => leafIds.has(paper.leafId)),
+    orders: repairStore.orders.filter((order) => leafIds.has(order.leafId)),
+    binding: bindingTable.rows.value.find((item) => item.volumeId === volumeId)
+  })
+}
+
+/** 表单当前所选册次的对账结果（含尚未装订的情形） */
+const formReconcile = computed(() => (form.volumeId ? reconcileOf(form.volumeId) : null))
+
+const blockedVolumes = computed(() =>
+  bookStore.volumes
+    .filter((volume) => !isVolumeLocked(volume.state))
+    .map((volume) => ({ volume, reconcile: reconcileOf(volume.id) }))
+    .filter((entry) => !entry.reconcile.canArchive)
+)
 
 /* ----------------------------- 装订表单 ----------------------------- */
 const dialog = ref(false)
@@ -130,6 +167,24 @@ async function submit(): Promise<void> {
   if (!form.volumeId) {
     ElMessage.warning('请选择册次')
     return
+  }
+  // 验收合格 → 先过归档前对账闸门：没有已定方案、或有挂起未说明的不符项，一律不许归档
+  if (form.verdict === 'pass') {
+    const reconcile = reconcileOf(form.volumeId)
+    if (!reconcile.canArchive) {
+      const reason =
+        reconcile.blockers.length > 0
+          ? reconcile.blockers.map((line) => `· ${line}`).join('\n')
+          : '该册没有已确认的修复方案，须先由主管在「修复方案」页订立 / 确认方案'
+      ElMessageBox.alert(
+        `归档前对账未通过，以下不符项先挂起，补登记偏离说明后才能归档：\n${reason}`,
+        '对账未通过，禁止归档',
+        { type: 'error', confirmButtonText: '去补偏离说明' }
+      )
+        .then(() => router.push('/plans'))
+        .catch(() => undefined)
+      return
+    }
   }
   if (editing.value) {
     await bindingTable.update(editing.value.id, { ...form })
@@ -208,7 +263,13 @@ async function handleFile(event: Event): Promise<void> {
     return
   }
   await importSnapshot(parsed as RestoreSnapshot)
-  await Promise.all([bookStore.loadBooks(), bookStore.loadVolumes(), leafStore.loadLeaves(), repairStore.loadOrders()])
+  await Promise.all([
+    bookStore.loadBooks(),
+    bookStore.loadVolumes(),
+    leafStore.loadLeaves(),
+    repairStore.loadOrders(),
+    planStore.loadAll()
+  ])
   ElMessage.success('导入完成，数据已覆盖')
 }
 
@@ -223,7 +284,13 @@ async function handleReset(): Promise<void> {
     return
   }
   await resetDatabase()
-  await Promise.all([bookStore.loadBooks(), bookStore.loadVolumes(), leafStore.loadLeaves(), repairStore.loadOrders()])
+  await Promise.all([
+    bookStore.loadBooks(),
+    bookStore.loadVolumes(),
+    leafStore.loadLeaves(),
+    repairStore.loadOrders(),
+    planStore.loadAll()
+  ])
   ElMessage.success('已清空并重新载入演示数据')
 }
 
@@ -268,6 +335,31 @@ function verdictColor(verdict: string): string {
       <StatBadge label="待装订册次" :value="stat.pendingBinding" suffix="册" tone="warning" />
       <StatBadge label="工序完成率" :value="`${totals.orderPercent}%`" :percent="totals.orderPercent" />
     </div>
+
+    <el-alert
+      v-if="blockedVolumes.length > 0"
+      style="margin-bottom: 16px"
+      type="error"
+      show-icon
+      :closable="false"
+      title="以下册次归档前对账未通过，验收合格也会被拦下，先去修复方案页补偏离说明"
+    >
+      <ul style="margin: 0; padding-left: 18px">
+        <li v-for="entry in blockedVolumes" :key="entry.volume.id">
+          {{ volumeLabel(entry.volume.id) }}：
+          <span v-if="entry.reconcile.blockers.length === 0">没有已确认的修复方案</span>
+          <span v-else>{{ entry.reconcile.blockers.join('；') }}</span>
+        </li>
+      </ul>
+    </el-alert>
+    <el-alert
+      v-else
+      style="margin-bottom: 16px"
+      type="success"
+      show-icon
+      :closable="false"
+      title="各待装订册次方案对账均无挂起项，验收合格即可归档。"
+    />
 
     <el-row :gutter="16">
       <el-col :xs="24" :xl="14">
@@ -328,7 +420,7 @@ function verdictColor(verdict: string): string {
         <el-card shadow="never" style="margin-top: 16px">
           <template #header>整库导出</template>
           <p class="gb-muted">
-            导出文件包含 6 张业务表全量数据与结构版本号，可在其他设备通过「导入 JSON」还原。
+            导出文件包含 8 张业务表全量数据与结构版本号，可在其他设备通过「导入 JSON」还原。
           </p>
           <div class="gb-toolbar">
             <el-button :icon="Download" @click="handleExport">JSON 备份</el-button>
@@ -370,12 +462,52 @@ function verdictColor(verdict: string): string {
           <el-input v-model="form.inspector" placeholder="如：程砚" />
         </el-form-item>
       </el-form>
+
+      <div v-if="form.verdict === 'pass' && formReconcile" class="gate-panel">
+        <p class="gate-panel__title">
+          归档前对账（{{ formReconcile.matchCount }} 项对得上 · {{ formReconcile.documentedCount }} 项已挂账 ·
+          {{ formReconcile.pendingCount }} 项挂起）
+        </p>
+        <el-table :data="formReconcile.items" size="small" border>
+          <el-table-column prop="label" label="对账项" min-width="110" />
+          <el-table-column prop="planned" label="原定" min-width="150" />
+          <el-table-column prop="actual" label="实做" min-width="150" />
+          <el-table-column label="结论" width="100">
+            <template #default="{ row }">
+              <el-tag
+                :style="{
+                  color: RECONCILE_STATUS_COLOR[row.status as keyof typeof RECONCILE_STATUS_COLOR],
+                  borderColor: `${RECONCILE_STATUS_COLOR[row.status as keyof typeof RECONCILE_STATUS_COLOR]}66`
+                }"
+                effect="plain"
+                round
+                size="small"
+              >
+                {{ RECONCILE_STATUS_LABEL[row.status as keyof typeof RECONCILE_STATUS_LABEL] }}
+              </el-tag>
+            </template>
+          </el-table-column>
+        </el-table>
+        <el-alert
+          v-if="!formReconcile.canArchive"
+          style="margin-top: 8px"
+          type="error"
+          show-icon
+          :closable="false"
+          title="对账未通过：挂起的不符项必须先在「修复方案」页补登记偏离说明，否则本次合格不会被接受。"
+        />
+      </div>
+
       <el-alert
         v-if="form.verdict === 'pass'"
-        type="success"
+        :type="formReconcile?.canArchive ? 'success' : 'error'"
         show-icon
         :closable="false"
-        title="验收合格将触发全册归档，册次锁定为只读"
+        :title="
+          formReconcile?.canArchive
+            ? '验收合格将触发全册归档，册次锁定为只读'
+            : '验收合格但对账未通过，保存时将被拦下，无法归档'
+        "
       />
       <el-alert
         v-else
@@ -391,3 +523,20 @@ function verdictColor(verdict: string): string {
     </el-dialog>
   </div>
 </template>
+
+<style scoped>
+.gate-panel {
+  margin-bottom: 12px;
+  padding: 10px;
+  background: #faf7f1;
+  border: 1px solid #ece5d8;
+  border-radius: 8px;
+}
+
+.gate-panel__title {
+  margin: 0 0 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #3a4a6b;
+}
+</style>

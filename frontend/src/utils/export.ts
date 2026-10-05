@@ -8,12 +8,22 @@ import type { Leaf } from '@/types/leaf'
 import type { Paper } from '@/types/paper'
 import type { RepairOrder } from '@/types/repairOrder'
 import type { Binding } from '@/types/binding'
+import type { RepairPlan } from '@/types/repairPlan'
+import type { Deviation } from '@/types/deviation'
 import { BOOK_LEVEL_LABEL } from '@/types/book'
 import { BINDING_TYPE_LABEL, VOLUME_STATE_LABEL } from '@/types/volume'
 import { DAMAGE_TYPE_LABEL, LEAF_STATE_LABEL } from '@/types/leaf'
 import { PAPER_TYPE_LABEL, deltaELevel } from '@/types/paper'
 import { REPAIR_NAME_LABEL } from '@/types/repairOrder'
 import { BINDING_VERDICT_LABEL } from '@/types/binding'
+import {
+  DEVIATION_KIND_LABEL,
+  DEVIATION_STATUS_LABEL
+} from '@/types/deviation'
+import {
+  RECONCILE_STATUS_LABEL,
+  reconcileVolume
+} from '@/utils/reconcile'
 import type { RestoreSnapshot } from './db'
 
 /** 触发浏览器下载 */
@@ -55,9 +65,11 @@ export interface ExportContext {
   papers: Paper[]
   repairOrders: RepairOrder[]
   bindings: Binding[]
+  repairPlans: RepairPlan[]
+  deviations: Deviation[]
 }
 
-/** 验收归档清单文本：按古籍 → 册次 → 书叶 → 工序展开 */
+/** 验收归档清单文本：按古籍 → 册次 → 方案对账 → 书叶 → 工序展开 */
 export function buildArchiveReport(context: ExportContext): string {
   const lines: string[] = ['古籍修复验收归档清单', `生成时间：${new Date().toLocaleString('zh-CN')}`, '']
   if (context.books.length === 0) {
@@ -70,6 +82,7 @@ export function buildArchiveReport(context: ExportContext): string {
     if (volumes.length === 0) lines.push('   （暂无册次）')
     volumes.forEach((volume) => {
       const leaves = context.leaves.filter((leaf) => leaf.volumeId === volume.id)
+      const leafIds = new Set(leaves.map((leaf) => leaf.id))
       const binding = context.bindings.find((item) => item.volumeId === volume.id)
       const totalArea = Math.round(leaves.reduce((sum, leaf) => sum + leaf.damageAreaCm2, 0) * 10) / 10
       const averagePh =
@@ -77,6 +90,45 @@ export function buildArchiveReport(context: ExportContext): string {
       lines.push(
         `   第 ${volume.volumeNo} 册　${BINDING_TYPE_LABEL[volume.bindingType]}　${VOLUME_STATE_LABEL[volume.state]}　叶数 ${volume.leafCount}　破损 ${totalArea} cm²　平均 pH ${averagePh}`
       )
+
+      // 修复方案与归档前对账
+      const reconcile = reconcileVolume({
+        volumeId: volume.id,
+        plans: context.repairPlans,
+        deviations: context.deviations,
+        leaves,
+        papers: context.papers.filter((paper) => leafIds.has(paper.leafId)),
+        orders: context.repairOrders.filter((order) => leafIds.has(order.leafId)),
+        binding
+      })
+      if (!reconcile.hasConfirmedPlan) {
+        lines.push('      修复方案：无已确认方案（不可归档）')
+      } else {
+        const plan = context.repairPlans.find((item) => item.id === reconcile.planId)
+        lines.push(
+          `      修复方案：v${plan?.version ?? 1}${plan?.origin === 'historical' ? '（历史回填）' : ''}　目标 pH ${
+            plan?.targetPh ?? '—'
+          }　补纸 ${plan ? PAPER_TYPE_LABEL[plan.paperType] : '—'}　预计完工 ${plan?.expectedFinishDate || '缺失'}`
+        )
+        reconcile.items.forEach((item) => {
+          lines.push(`         〔${RECONCILE_STATUS_LABEL[item.status]}〕${item.label}：${item.planned} ／ ${item.actual}`)
+        })
+        lines.push(
+          `      对账结论：${
+            reconcile.canArchive ? '通过，可归档' : `不通过，${reconcile.pendingCount} 项挂起，禁止归档`
+          }`
+        )
+        context.deviations
+          .filter((deviation) => deviation.volumeId === volume.id)
+          .forEach((deviation) => {
+            lines.push(
+              `      偏离说明（${DEVIATION_KIND_LABEL[deviation.kind]}·${DEVIATION_STATUS_LABEL[deviation.status]}）：${
+                deviation.plannedValue
+              } ／ ${deviation.actualValue}　原因：${deviation.reason}　登记人 ${deviation.operator || '未署'}`
+            )
+          })
+      }
+
       lines.push(
         `      装订验收：${
           binding
